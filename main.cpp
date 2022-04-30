@@ -2,10 +2,14 @@
 #include<string>
 #include<memory>
 #include<vector>
+#include<map>
 
 
 using std::vector;
 using std::unique_ptr;
+using std::map;
+using std::make_unique;
+using std::move;
 using std::string;
 using std::cout;
 using std::endl;
@@ -81,6 +85,7 @@ static int getTok(){
 
 // THE AST(Abstract Syntax Tree)
 
+namespace {
 // the base class for all nodes of the AST
 class ExprAST {
     public:
@@ -147,18 +152,268 @@ class FunctionAST {
                     unique_ptr<ExprAST> Body)
             : Proto(move(Proto)), Body(move(Body)) {}
 };
+}
+
+// THE PARSER
+static int currTok; // current token
+static int getNextToken() { 
+    return currTok = getTok();
+}
+
+// PARSING BINARY EXPRESSIONS
+static map<char, int> BinopPrecedence;
+
+// get the precedence of the pending binary operator token.
+static int GetTokPrecedence(){
+    switch(currTok){
+        case '<':
+        case '>':
+            return 10;
+        case '+':
+        case '-':
+            return 20;
+        case '*':
+        case '/':
+            return 40; // highest precedence
+        default:
+            return -1;
+    }
+}
 
 
+// error reporting for expressions
+void LogError(const char *Str) {
+    fprintf(stderr, "LogError: %s\n", Str); // print error
+    // return nullptr; // null pointer
+}
 
-
-// int main(){
-//     while(true)
-//         cout << "Token: " << getTok() << endl;
-//     return 0;
+// error reporting for function prototypes
+// unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+//     LogError(Str); // print error
+//     // return nullptr;
 // }
 
-// AST
+static unique_ptr<ExprAST> ParseExpression();
 
+// PARSING NUMBER EXPRESSIONS
+static unique_ptr<ExprAST> ParseNumberExpr() {
+    auto Result = make_unique<NumberExprAST>(numStr); // create and allocate
+    getNextToken(); // consume the number
+    return move(Result);
+}
+
+// PARSING PARENTHESIS EXPRESSIONS
+static unique_ptr<ExprAST> ParseParenExpr(){
+    getNextToken(); // eat (. --> we expect '(' to come first
+    auto V = ParseExpression();
+    if (!V) return nullptr; // the above statement failed
+    
+    if(currTok == ')'){ // if we previously ate '(' we expect ')'
+        getNextToken(); // eat ).
+        return V; // return expression
+    }else{
+        LogError("expected ')'"); // not got what was expected
+        return nullptr;
+    }
+    return V;
+}
+
+// PARSING IDENTIFIERS AND FUNCTION CALL EXPRESSIONS
+static unique_ptr<ExprAST> ParseIdentifierOrCallExpr(){
+    string IdName = identifierStr;
+
+    getNextToken();  // eat identifier.
+
+    if(currTok == '('){ // parse args list
+        getNextToken();  // eat (. -> eat open paren
+        vector<unique_ptr<ExprAST>> Args; // strore arguments
+        while(1){
+            auto Arg = ParseExpression();
+            if (Arg)
+                Args.push_back(move(Arg)); // push to vector
+            else
+                return nullptr; // return null pointer
+
+            if(currTok == ')'){
+                getNextToken(); // eat
+                break;
+            }else if(currTok == ','){ // more arguments
+                getNextToken(); //eat
+                continue;
+            }else{ // report errors
+                LogError("Expected ')' or ',' in argument list \n");
+            }
+        }
+    }
+    return make_unique<VariableExprAST>(IdName);
+}
+
+// PARSING PRIMARIES
+static unique_ptr<ExprAST> ParsePrimary() {
+    switch (currTok) {
+        case tok_identifier: // identifiers
+            return ParseIdentifierOrCallExpr(); // parse identifier
+        case tok_number: // number literal
+            return ParseNumberExpr(); // parse number literal
+        case '(': // parenthesis
+            return ParseParenExpr(); // parse parenthesis
+        default: // report error
+            LogError("Unknown token. expected an expression \n");
+            return nullptr;
+    }
+}
+
+// PARSE RIGHT-HAND SIDE
+static unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, unique_ptr<ExprAST> LHS){
+    // If this is a binop, find its precedence.
+    while (1) { // keep parsing right hand side
+        int TokPrec = GetTokPrecedence(); // get precedence
+
+        // If this is a binop that binds at least as tightly as the current binop,
+        // consume it, otherwise we are done.
+        if (TokPrec < ExprPrec) // precedence is < than curr precedence
+            return LHS; // return left-hand side
+        else{
+            int BinOp = currTok;
+            getNextToken();  // eat binop
+
+            // Parse the primary expression after the binary operator.
+            auto RHS = ParsePrimary(); // parse right-hand side
+            if(RHS){
+                int NextPrec = GetTokPrecedence();
+                if(TokPrec < NextPrec){ // get next
+                    RHS = ParseBinOpRHS(TokPrec+1, move(RHS));
+                    if(!RHS) return nullptr;
+                }
+                // merge curr LHS, curr RHS to make a new binary expression AST as new LHS
+                LHS = make_unique<BinaryExprAST>(BinOp, move(LHS), move(RHS));
+            }else return nullptr;
+            
+        }
+    }
+}
+
+// PARSE BINARY EXPRESSION
+static unique_ptr<ExprAST> ParseExpression() {
+    auto LHS = ParsePrimary();
+
+    if(LHS){
+        return ParseBinOpRHS(0, move(LHS)); // parse left side
+    }else return nullptr;
+}
+
+// PARSING FUNCTION PROTOTYPES - function signature
+static unique_ptr<PrototypeAST> ParsePrototype(){
+    if (currTok != tok_identifier){ // current token, not token identfier
+        LogError("Expected function name in prototype \n"); // report error
+        return nullptr;
+    }
+
+    string fnName = identifierStr;
+    getNextToken(); // eat identifier
+
+    if(currTok != '('){ // report error
+        LogError("Expected '(' in prototype \n");
+         return nullptr;
+    }
+
+    // Read the list of argument names.
+    vector<string> argNames; // srore argument names
+    while (getNextToken() == tok_identifier)
+        argNames.push_back(identifierStr); // add to vector
+    if(currTok != ')'){ // report error
+        LogError("Expected ')' in prototype \n");
+         return nullptr;
+    }
+
+    // success.
+    getNextToken();  // eat ')'.
+
+    return make_unique<PrototypeAST>(fnName, move(argNames)); // unique pointer to a prototype AST
+}
+
+// PARSING FUNCTION DEFINITIONS
+static unique_ptr<FunctionAST> ParseDefinition(){
+    getNextToken();  // eat 'def' token
+    auto Proto = ParsePrototype();
+    if(!Proto) return nullptr;
+
+    auto E = ParseExpression();
+    if(E) return make_unique<FunctionAST>(move(Proto), move(E)); // unique pointer to a new function AST
+
+    return nullptr; // otherwise return null pointer
+}
+
+// PARSING THE EXTERN KEYWORD
+static unique_ptr<PrototypeAST> ParseExtern(){
+    getNextToken();  // eat extern token
+    return ParsePrototype();
+}
+
+
+// PARSING TOP-LEVEL EXPRESSIONS
+static unique_ptr<FunctionAST> ParseTopLevelExpr(){
+    auto E = ParseExpression();
+    if(E){
+        // Make an anonymous proto.
+        auto proto = make_unique<PrototypeAST>("", vector<string>());
+        return make_unique<FunctionAST>(move(proto), move(E));
+    }
+    return nullptr;
+}
+
+// TOP_LEVEL PARSING
+static void handleDefinition(){
+    if(ParseDefinition()) fprintf(stderr, "Parsed a function definition. \n");
+    else getNextToken();
+}
+
+static void handleExtern(){
+    if(ParseExtern()) fprintf(stderr, "Parsed an extern. \n");
+    else getNextToken();
+}
+
+static void handleTopLevelExpression(){
+    if(ParseTopLevelExpr()) fprintf(stderr, "Parsed a top-level expression. \n");
+    else getNextToken();
+}
+
+
+
+// DRIVER CODE - repl
+static void run(){
+  while (1) {
+    fprintf(stderr, "ready> ");
+    switch(currTok){
+        case tok_eof:
+            return;
+        case ';': // ignore top-level semicolons.
+            getNextToken();
+        break;
+        case tok_def:
+            handleDefinition();
+        break;
+        case tok_extern:
+            handleExtern();
+        break;
+        default:
+            handleTopLevelExpression();
+        break;
+    }
+  }
+}
+int main(){
+    // test lexer
+    // while(true)
+    //     cout << "Token: " << getTok() << endl;
+    // test parser
+      // Prime the first token.
+    fprintf(stderr, "ready> ");
+    getNextToken();
+    run();
+    return 0;
+}
 
 // compilation and execution
-//  g++ lexer.cpp -o lexer.bin; ./lexer.bin
+// clang++  main.cpp -o main.bin
+// ./main.bin
