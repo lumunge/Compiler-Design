@@ -1,3 +1,4 @@
+// #include "../include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -6,9 +7,15 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <iostream>
 #include <string>
 #include <memory>
@@ -52,7 +59,7 @@ enum Token
 
 // global variables
 static string identifierStr; // identifier string saved here
-static double numStr;        // number saved here
+static double numVal;        // number saved here
 
 // get tokens, remove white space
 static int getTok()
@@ -84,9 +91,9 @@ static int getTok()
         {
             numStr += lastChar;   // append to numStr
             lastChar = getchar(); // get next character
-        } while (isdigit(lastChar) || lastChar == '-');
-        numStr = strtod(numStr.c_str(), 0); // do while numbers/dots are available
-        return tok_number;                  // return number token
+        } while (isdigit(lastChar) || lastChar == '.');
+        numVal = strtod(numStr.c_str(), nullptr); // do while numbers/dots are available
+        return tok_number;                        // return number token
     }
 
     // process comments
@@ -150,9 +157,9 @@ namespace // anonymous namespace
         unique_ptr<ExprAST> LHS, RHS;
 
     public:
-        BinaryExprAST(char op, unique_ptr<ExprAST> LHS,
+        BinaryExprAST(char Op, unique_ptr<ExprAST> LHS,
                       unique_ptr<ExprAST> RHS)
-            : Op(op), LHS(move(LHS)), RHS(move(RHS)) {}
+            : Op(Op), LHS(move(LHS)), RHS(move(RHS)) {}
         virtual Value *codegen();
     };
 
@@ -207,7 +214,7 @@ static int getNextToken()
 static map<char, int> BinopPrecedence;
 
 // get the precedence of the pending binary operator token.
-static int GetTokPrecedence()
+static int getTokPrecedence()
 {
     switch (currTok)
     {
@@ -236,7 +243,7 @@ static unique_ptr<ExprAST> ParseExpression();
 // PARSING NUMBER EXPRESSIONS
 static unique_ptr<ExprAST> ParseNumberExpr()
 {
-    auto Result = make_unique<NumberExprAST>(numStr); // create and allocate
+    auto Result = make_unique<NumberExprAST>(numVal); // create and allocate
     getNextToken();                                   // consume the number
     return move(Result);
 }
@@ -249,55 +256,53 @@ static unique_ptr<ExprAST> ParseParenExpr()
     if (!V)
         return nullptr; // the above statement failed
 
-    if (currTok == ')')
-    {                   // if we previously ate '(' we expect ')'
-        getNextToken(); // eat ).
-        return V;       // return expression
-    }
-    else
+    if (currTok != ')') // if we previously ate '(' we expect ')'
     {
         LogError("expected ')'"); // not got what was expected
         return nullptr;
     }
-    return V;
+    getNextToken(); // eat ).
+    return V;       // return expression
 }
 
 // PARSING IDENTIFIERS AND FUNCTION CALL EXPRESSIONS
 static unique_ptr<ExprAST> ParseIdentifierOrCallExpr()
 {
-    string IdName = identifierStr;
+    string idName = identifierStr;
 
     getNextToken(); // eat identifier.
 
-    if (currTok == '(')
-    {                                     // parse args list
-        getNextToken();                   // eat (. -> eat open paren
-        vector<unique_ptr<ExprAST>> Args; // strore arguments
-        while (1)
+    if (currTok != '(') // Simple variable ref.
+        return make_unique<VariableExprAST>(idName);
+
+    // Call.
+    getNextToken(); // eat (
+    vector<unique_ptr<ExprAST>> Args;
+    if (currTok != ')')
+    {
+        while (true)
         {
-            auto Arg = ParseExpression();
-            if (Arg)
-                Args.push_back(move(Arg)); // push to vector
+            if (auto Arg = ParseExpression())
+                Args.push_back(move(Arg));
             else
-                return nullptr; // return null pointer
+                return nullptr;
 
             if (currTok == ')')
-            {
-                getNextToken(); // eat
                 break;
+
+            if (currTok != ',')
+            {
+                LogError("Expected ')' or ',' in argument list");
+                return nullptr;
             }
-            else if (currTok == ',')
-            {                   // more arguments
-                getNextToken(); //eat
-                continue;
-            }
-            else
-            { // report errors
-                LogError("Expected ')' or ',' in argument list \n");
-            }
+            getNextToken();
         }
     }
-    return make_unique<VariableExprAST>(IdName);
+
+    // Eat the ')'.
+    getNextToken();
+
+    return make_unique<CallExprAST>(idName, move(Args));
 }
 
 // PARSING PRIMARIES
@@ -323,7 +328,7 @@ static unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, unique_ptr<ExprAST> LHS)
     // If this is a binop, find its precedence.
     while (1)
     {                                     // keep parsing right hand side
-        int TokPrec = GetTokPrecedence(); // get precedence
+        int TokPrec = getTokPrecedence(); // get precedence
 
         // If this is a binop that binds at least as tightly as the current binop,
         // consume it, otherwise we are done.
@@ -338,7 +343,7 @@ static unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, unique_ptr<ExprAST> LHS)
             auto RHS = ParsePrimary(); // parse right-hand side
             if (RHS)
             {
-                int NextPrec = GetTokPrecedence();
+                int NextPrec = getTokPrecedence();
                 if (TokPrec < NextPrec)
                 { // get next
                     RHS = ParseBinOpRHS(TokPrec + 1, move(RHS));
@@ -441,6 +446,8 @@ static unique_ptr<LLVMContext> TheContext; // owns core LLVM data structures
 static unique_ptr<IRBuilder<>> Builder;    // helper object for generating LLVM instructions
 static unique_ptr<Module> TheModule;       // LLVM construct with functions and global variables
 static map<string, Value *> NamedValues;   // store defined identifiers -> symbol table
+// optimizer
+// static unique_ptr<legacy::FunctionPassManager> TheFPM;
 
 Value *LogErrorV(const char *Str)
 {
@@ -459,7 +466,7 @@ Value *VariableExprAST::codegen()
 {
     Value *V = NamedValues[Name]; // find in symbol table
     if (!V)
-        LogErrorV("Unknown variable name"); // not in table
+        LogErrorV("Unknown variable name - Sijui"); // not in table
     return V;
 }
 
@@ -483,7 +490,7 @@ Value *BinaryExprAST::codegen()
         L = Builder->CreateFCmpULT(L, R, "cmptmp");                                 // comparison <>
         return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp"); // Convert bool 0/1 to double 0.0 or 1.0
     default:
-        return LogErrorV("invalid binary operator"); // report error
+        return LogErrorV("Invalid binary operator"); // report error
     }
 }
 
@@ -516,9 +523,9 @@ Function *PrototypeAST::codegen()
     Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get()); // create function based on function type
 
     // Set names for all arguments.
-    unsigned Idx = 0;
+    unsigned idx = 0;
     for (auto &Arg : F->args())
-        Arg.setName(Args[Idx++]); // set function arguments names
+        Arg.setName(Args[idx++]); // set function arguments names
 
     return F;
 }
@@ -548,6 +555,8 @@ Function *FunctionAST::codegen()
 
         verifyFunction(*TheFunction); // verify generated code -> check consistency -> catch bugs
 
+        // TheFPM->run(*TheFunction); // optmize
+
         return TheFunction; // return function
     }
     TheFunction->eraseFromParent(); // otherwise cleanup
@@ -557,8 +566,8 @@ Function *FunctionAST::codegen()
 // TOP_LEVEL PARSING
 static void InitializeModule()
 {
-    TheContext = make_unique<LLVMContext>();                     // new context
-    TheModule = make_unique<Module>("my cool jit", *TheContext); // new module
+    TheContext = make_unique<LLVMContext>();                                    // new context
+    TheModule = make_unique<Module>("JIT(Just In Time Compiler)", *TheContext); // new module
 
     Builder = make_unique<IRBuilder<>>(*TheContext); // create new builder
 }
@@ -642,6 +651,22 @@ static void run()
     }
 }
 
+// OPTIMIZATION
+
+// void InitializeModuleAndPassManager(void)
+// {
+//     TheModule = make_unique<Module>("JIT AND OPTIMIZE", *TheContext); // create new module
+
+//     TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get()); // attach a pass manager
+
+//     TheFPM->add(createInstructionCombiningPass()); // peephole and bit-twiddling optimizations
+//     TheFPM->add(createReassociatePass());          // reassociation expressions
+//     TheFPM->add(createGVNPass());                  // common subexpression elimination
+//     TheFPM->add(createCFGSimplificationPass());    // removing unreachable blocks -> simple control flow graph
+
+//     TheFPM->doInitialization();
+// }
+
 int main()
 {
     // test lexer
@@ -649,6 +674,7 @@ int main()
     //     cout << "Token: " << getTok() << endl;
     // test parser
     // Prime the first token.
+    // InitializeModuleAndPassManager();
     fprintf(stderr, "ready> ");
     getNextToken();
     InitializeModule(); // create module to hold code

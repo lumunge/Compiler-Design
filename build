@@ -1,2 +1,2 @@
 clang++ -mlinker-version=409.12 -g -O3 main.cpp -o main.bin `llvm-config --cxxflags --ldflags --system-libs --libs core`
-# clang++ -g -O3 coded.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core` -o coded
+# clang++ -mlinker-version=409.12 -g -O3 coded.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core` -o coded
