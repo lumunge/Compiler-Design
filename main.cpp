@@ -447,7 +447,7 @@ static unique_ptr<IRBuilder<>> Builder;    // helper object for generating LLVM 
 static unique_ptr<Module> TheModule;       // LLVM construct with functions and global variables
 static map<string, Value *> NamedValues;   // store defined identifiers -> symbol table
 // optimizer
-// static unique_ptr<legacy::FunctionPassManager> TheFPM;
+static unique_ptr<legacy::FunctionPassManager> TheFPM;
 
 Value *LogErrorV(const char *Str)
 {
@@ -555,7 +555,7 @@ Function *FunctionAST::codegen()
 
         verifyFunction(*TheFunction); // verify generated code -> check consistency -> catch bugs
 
-        // TheFPM->run(*TheFunction); // optmize
+        TheFPM->run(*TheFunction); // optmize
 
         return TheFunction; // return function
     }
@@ -563,15 +563,25 @@ Function *FunctionAST::codegen()
     return nullptr;                 // return null pointer
 }
 
-// TOP_LEVEL PARSING
-static void InitializeModule()
+// OPTIMIZATION
+void InitializeModuleAndPassManager(void)
 {
-    TheContext = make_unique<LLVMContext>();                                    // new context
-    TheModule = make_unique<Module>("JIT(Just In Time Compiler)", *TheContext); // new module
+    TheContext = make_unique<LLVMContext>();                          // new context
+    TheModule = make_unique<Module>("JIT AND OPTIMIZE", *TheContext); // create new module
 
-    Builder = make_unique<IRBuilder<>>(*TheContext); // create new builder
+    Builder = make_unique<IRBuilder<>>(*TheContext); // new builder for module
+
+    TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get()); // attach a pass manager
+
+    TheFPM->add(createInstructionCombiningPass()); // peephole and bit-twiddling optimizations
+    TheFPM->add(createReassociatePass());          // reassociation expressions
+    TheFPM->add(createGVNPass());                  // common subexpression elimination
+    TheFPM->add(createCFGSimplificationPass());    // removing unreachable blocks -> simple control flow graph
+
+    TheFPM->doInitialization();
 }
 
+// TOP_LEVEL PARSING
 static void handleDefinition()
 {
     if (auto FnAST = ParseDefinition())
@@ -651,22 +661,6 @@ static void run()
     }
 }
 
-// OPTIMIZATION
-
-// void InitializeModuleAndPassManager(void)
-// {
-//     TheModule = make_unique<Module>("JIT AND OPTIMIZE", *TheContext); // create new module
-
-//     TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get()); // attach a pass manager
-
-//     TheFPM->add(createInstructionCombiningPass()); // peephole and bit-twiddling optimizations
-//     TheFPM->add(createReassociatePass());          // reassociation expressions
-//     TheFPM->add(createGVNPass());                  // common subexpression elimination
-//     TheFPM->add(createCFGSimplificationPass());    // removing unreachable blocks -> simple control flow graph
-
-//     TheFPM->doInitialization();
-// }
-
 int main()
 {
     // test lexer
@@ -677,7 +671,7 @@ int main()
     // InitializeModuleAndPassManager();
     fprintf(stderr, "ready> ");
     getNextToken();
-    InitializeModule(); // create module to hold code
+    InitializeModuleAndPassManager(); // create module to hold code
     run();
     TheModule->print(errs(), nullptr); // print generated code
     return 0;
